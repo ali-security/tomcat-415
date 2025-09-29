@@ -48,6 +48,7 @@ import org.apache.coyote.http2.Http2Parser.Input;
 import org.apache.coyote.http2.Http2Parser.Output;
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
+import org.apache.tomcat.util.ExceptionUtils;
 import org.apache.tomcat.util.http.MimeHeaders;
 import org.apache.tomcat.util.http.parser.Priority;
 import org.apache.tomcat.util.log.UserDataHelper;
@@ -442,6 +443,13 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
                 log.debug(sm.getString("upgradeHandler.ioerror", connectionId), ioe);
             }
             close();
+        } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
+            if (log.isDebugEnabled()) {
+                log.debug(sm.getString("upgradeHandler.throwable", connectionId), t);
+            }
+            // Unexpected errors close the connection.
+            close();
         }
 
         if (log.isTraceEnabled()) {
@@ -572,6 +580,8 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
             log.trace(sm.getString("upgradeHandler.rst.debug", connectionId, Integer.toString(se.getStreamId()),
                     se.getError(), se.getMessage()));
         }
+
+        increaseOverheadCount(FrameType.RST, getProtocol().getOverheadResetFactor());
 
         // Write a RST frame
         byte[] rstFrame = new byte[13];
@@ -1407,39 +1417,59 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
 
 
     void reduceOverheadCount(FrameType frameType) {
-        // A non-overhead frame reduces the overhead count by
-        // Http2Protocol.DEFAULT_OVERHEAD_REDUCTION_FACTOR. A simple browser
-        // request is likely to have one non-overhead frame (HEADERS) and one
-        // overhead frame (REPRIORITISE). With the default settings the overhead
-        // count will reduce by 10 for each simple request.
-        // Requests and responses with bodies will create additional
-        // non-overhead frames, further reducing the overhead count.
+       /*
+         * A non-overhead frame reduces the overhead count by {@code Http2Protocol.DEFAULT_OVERHEAD_REDUCTION_FACTOR}.
+         *
+         * A simple browser request is likely to have one non-overhead frame (HEADERS) that results in a response with
+         * one further non-overhead frame (DATA). With the default settings, the overhead count will reduce by 40 for
+         * each simple request.
+         *
+         * Requests and responses with bodies will create additional non-overhead frames, further reducing the overhead
+         * count.
+         */
         updateOverheadCount(frameType, Http2Protocol.DEFAULT_OVERHEAD_REDUCTION_FACTOR);
     }
 
 
     @Override
     public void increaseOverheadCount(FrameType frameType) {
-        // An overhead frame increases the overhead count by
-        // overheadCountFactor. By default, this means an overhead frame
-        // increases the overhead count by 10. A simple browser request is
-        // likely to have one non-overhead frame (HEADERS) and one overhead
-        // frame (REPRIORITISE). With the default settings the overhead count
-        // will reduce by 10 for each simple request.
+        /*
+         * An overhead frame (SETTINGS, PRIORITY, PING) increases the overhead count by overheadCountFactor. By default,
+         * this means an overhead frame increases the overhead count by 10.
+         *
+         * If the client ignores maxConcurrentStreams then any HEADERS frame received will also increase the overhead
+         * count by overheadCountFactor.
+         *
+         * A simple browser request should not trigger any overhead frames.
+         */
         updateOverheadCount(frameType, getProtocol().getOverheadCountFactor());
     }
 
 
-    private void increaseOverheadCount(FrameType frameType, int increment) {
-        // Overhead frames that indicate inefficient (and potentially malicious)
-        // use of small frames trigger an increase that is inversely
-        // proportional to size. The default threshold for all three potential
-        // areas for abuse (HEADERS, DATA, WINDOW_UPDATE) is 1024 bytes. Frames
-        // with sizes smaller than this will trigger an increase of
-        // threshold/size.
-        // DATA and WINDOW_UPDATE take an average over the last two non-final
-        // frames to allow for client buffering schemes that can result in some
-        // small DATA payloads.
+    /**
+     * Used to increase the overhead for frames that don't use the {@code overheadCountFactor} ({@code CONTINUATION},
+     * {@code DATA}, {@code WINDOW_UPDATE} and {@code RESET}).
+     *
+     * @param frameType The frame type triggering the overhead increase
+     * @param increment The amount by which the overhead is increased
+     */
+    protected void increaseOverheadCount(FrameType frameType, int increment) {
+        /*
+         * Three types of frame are susceptible to inefficient (and potentially malicious) use of small frames. These
+         * trigger an increase in overhead that is inversely proportional to size. The default threshold for all three
+         * potential areas for abuse (CONTINUATION, DATA, WINDOW_UPDATE) is 1024 bytes. Frames with sizes smaller than
+         * this will trigger an increase of threshold/size.
+         *
+         * The check for DATA and WINDOW_UPDATE frames takes an average over the last two frames to allow for client
+         * buffering schemes that can result in some small DATA payloads.
+         *
+         * The CONTINUATION and DATA frames checks are skipped for end of headers (CONTINUATION) and end of stream
+         * (DATA) as those frames may be small for legitimate reasons.
+         *
+         * RESET frames (received or sent) trigger an increase of overheadResetFactor.
+         *
+         * In all cases, the calling method determines the extent to which the overhead count is increased.
+         */
         updateOverheadCount(frameType, increment);
     }
 
@@ -1648,9 +1678,9 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
             if (payloadSize < overheadThreshold) {
                 if (payloadSize == 0) {
                     // Avoid division by zero
-                    increaseOverheadCount(FrameType.HEADERS, overheadThreshold);
+                    increaseOverheadCount(FrameType.CONTINUATION, overheadThreshold);
                 } else {
-                    increaseOverheadCount(FrameType.HEADERS, overheadThreshold / payloadSize);
+                    increaseOverheadCount(FrameType.CONTINUATION, overheadThreshold / payloadSize);
                 }
             }
         }
